@@ -1,16 +1,13 @@
-// sender_strict_match.ino
-// ESC-style PWM on GPIO32 (50 Hz, 1000–2000 us)
-// Magnetorquer on GPIO14
-
-#include <Arduino.h>
-#include <Wire.h>
+#include <WiFi.h>
+#include <WebServer.h>
 #include <SPI.h>
 #include <LoRa.h>
-#include <math.h>
 
-// =====================
-// LORA
-// =====================
+// ---------- WiFi ----------
+const char* ssid     = "JordyKam";
+const char* password = "PirateKingLuffy#2451";
+
+// ---------- LoRa pins ----------
 #define LORA_SCK   5
 #define LORA_MISO  21
 #define LORA_MOSI  19
@@ -19,95 +16,39 @@
 #define LORA_DIO0  15
 #define LORA_FREQ  915E6
 
-// =====================
-// IMU (MPU6050)
-// =====================
-#define I2C_SDA 25
-#define I2C_SCL 26
-#define MPU 0x68
+WebServer server(80);
 
-int16_t AcX, AcY, AcZ, Tmp, GyX, GyY, GyZ;
-double pitch = 0, roll = 0, tC = 0, tF = 0;
+// ---------- Last RX ----------
+String lastRxRaw = "None";
+long   lastRxRSSI = 0;
+unsigned long lastRxMs = 0;
+unsigned long rxCount = 0;
 
-// =====================
-// MAGNETORQUER
-// =====================
-#define MAG_PIN 14
-bool magOn = false;
+// Parsed fields
+String ctrS   = "-";
+String pitchS = "-";
+String rollS  = "-";
+String axS = "-", ayS = "-", azS = "-";
+String gxS = "-", gyS = "-", gzS = "-";
+String tCS = "-", tFS = "-";
+String magS = "-";
+String rwS  = "-";
 
-// =====================
-// ESC / REACTION WHEEL
-// =====================
-#define RW_PIN 32
-bool rwEnabled = false;
+// RX log ring buffer
+static const int RX_LOG_MAX = 12;
+String rxLog[RX_LOG_MAX];
+int rxLogCount = 0;
+int rxLogHead  = 0;
 
-// PWM parameters (match MicroPython)
-#define ESC_FREQ_HZ     50
-#define ESC_PWM_BITS    16
-#define ESC_PWM_MAX     65535
-
-#define ESC_US_MIN      1000
-#define ESC_US_MAX      2000
-#define ESC_US_IDLE     1000
-#define ESC_US_RUN      1700   // throttle when RW=1 (adjust)
-
-// =====================
-// TIMING
-// =====================
-unsigned long lastTx = 0;
-int counter = 0;
-
-// =====================
-// HELPERS
-// =====================
-uint32_t usToDuty(uint16_t us) {
-  // duty = (us / 20000) * 65535
-  return (uint32_t)((((uint32_t)us) * ESC_PWM_MAX) / 20000UL);
+static void addToRxLog(const String& line) {
+  rxLog[rxLogHead] = line;
+  rxLogHead = (rxLogHead + 1) % RX_LOG_MAX;
+  if (rxLogCount < RX_LOG_MAX) rxLogCount++;
 }
 
-void setESCmicroseconds(uint16_t us) {
-  if (us < ESC_US_MIN) us = ESC_US_MIN;
-  if (us > ESC_US_MAX) us = ESC_US_MAX;
-  analogWrite(RW_PIN, usToDuty(us));
-}
-
-void applyOutputs() {
-  digitalWrite(MAG_PIN, magOn ? HIGH : LOW);
-
-  if (rwEnabled) {
-    setESCmicroseconds(ESC_US_RUN);
-  } else {
-    setESCmicroseconds(ESC_US_IDLE);
-  }
-}
-
-void getAngle(int Ax, int Ay, int Az) {
-  pitch = atan((double)Ax / sqrt((double)Ay * Ay + (double)Az * Az)) * 180.0 / PI;
-  roll  = atan((double)Ay / sqrt((double)Ax * Ax + (double)Az * Az)) * 180.0 / PI;
-}
-
-void sampleIMU() {
-  Wire.beginTransmission(MPU);
-  Wire.write(0x3B);
-  Wire.endTransmission(false);
-  Wire.requestFrom(MPU, 14, true);
-
-  AcX = (Wire.read() << 8) | Wire.read();
-  AcY = (Wire.read() << 8) | Wire.read();
-  AcZ = (Wire.read() << 8) | Wire.read();
-  Tmp = (Wire.read() << 8) | Wire.read();
-  GyX = (Wire.read() << 8) | Wire.read();
-  GyY = (Wire.read() << 8) | Wire.read();
-  GyZ = (Wire.read() << 8) | Wire.read();
-
-  tC = (double)Tmp / 340.0 + 36.53;
-  tF = tC * 9.0 / 5.0 + 32.0;
-
-  getAngle(AcX, AcY, AcZ);
-}
-
-static String sanitizeText(const String& in) {
+static String sanitizeRx(const String& in) {
   String out;
+  out.reserve(in.length());
   for (size_t i = 0; i < in.length(); i++) {
     char c = in[i];
     if (c >= 32 && c <= 126) out += c;
@@ -116,113 +57,182 @@ static String sanitizeText(const String& in) {
   return out;
 }
 
-// =====================
-// COMMAND RX
-// =====================
-void handleLoRaCommands() {
-  int packetSize = LoRa.parsePacket();
-  if (!packetSize) return;
-
-  String cmd;
-  while (LoRa.available()) cmd += (char)LoRa.read();
-  cmd = sanitizeText(cmd);
-
-  if (!cmd.startsWith("CMD:")) return;
-  if (!cmd.endsWith(";")) return;
-
-  if (cmd.indexOf("MAG=1") >= 0) magOn = true;
-  if (cmd.indexOf("MAG=0") >= 0) magOn = false;
-
-  if (cmd.indexOf("RW=1") >= 0) rwEnabled = true;
-  if (cmd.indexOf("RW=0") >= 0) rwEnabled = false;
-
-  applyOutputs();
-
-  Serial.print("RX CMD: ");
+// ---------- Command TX ----------
+void sendCommand(const String& cmd) {
+  LoRa.beginPacket();
+  LoRa.print(cmd);
+  LoRa.endPacket();
+  LoRa.receive();   // <<< CRITICAL: return to RX mode
+  Serial.print("TX CMD: ");
   Serial.println(cmd);
 }
 
-// =====================
-// TELEMETRY
-// =====================
-void sendTelemetry() {
-  String pkt;
-  pkt.reserve(220);
+// /cmd?mag=1  or  /cmd?rw=0
+void handleCmd() {
+  bool sent = false;
 
-  pkt += "IMU,";
-  pkt += counter; pkt += ",";
-  pkt += pitch; pkt += ",";
-  pkt += roll; pkt += ",";
-  pkt += AcX; pkt += ",";
-  pkt += AcY; pkt += ",";
-  pkt += AcZ; pkt += ",";
-  pkt += GyX; pkt += ",";
-  pkt += GyY; pkt += ",";
-  pkt += GyZ; pkt += ",";
-  pkt += tC; pkt += ",";
-  pkt += tF; pkt += ",";
-  pkt += "MAG,"; pkt += (magOn ? "1" : "0"); pkt += ",";
-  pkt += "RW,";  pkt += (rwEnabled ? "1" : "0");
+  if (server.hasArg("mag")) {
+    String v = server.arg("mag"); v.trim();
+    if (v == "0" || v == "1") {
+      sendCommand("CMD:MAG=" + v + ";");
+      sent = true;
+    }
+  }
 
-  LoRa.beginPacket();
-  LoRa.print(pkt);
-  LoRa.endPacket();
-  LoRa.receive();
+  if (server.hasArg("rw")) {
+    String v = server.arg("rw"); v.trim();
+    if (v == "0" || v == "1") {
+      sendCommand("CMD:RW=" + v + ";");
+      sent = true;
+    }
+  }
 
-  Serial.println(pkt);
+  if (!sent) {
+    server.send(400, "text/plain",
+      "Bad cmd. Use /cmd?mag=0|1 or /cmd?rw=0|1");
+    return;
+  }
+
+  server.sendHeader("Location", "/");
+  server.send(303);
 }
 
-// =====================
-// SETUP
-// =====================
+// ---------- Telemetry parser ----------
+// IMU,<ctr>,<pitch>,<roll>,<AcX>,<AcY>,<AcZ>,<GyX>,<GyY>,<GyZ>,<tC>,<tF>,MAG,<0/1>,RW,<0/1>
+static bool parseIMUTelemetry(const String& msg) {
+  if (!msg.startsWith("IMU,")) return false;
+
+  String toks[32];
+  int nt = 0;
+  int start = 0;
+
+  while (nt < 32) {
+    int comma = msg.indexOf(',', start);
+    if (comma < 0) {
+      toks[nt++] = msg.substring(start);
+      break;
+    } else {
+      toks[nt++] = msg.substring(start, comma);
+      start = comma + 1;
+    }
+  }
+
+  if (nt < 16) return false;
+
+  ctrS   = toks[1];
+  pitchS = toks[2];
+  rollS  = toks[3];
+  axS    = toks[4];
+  ayS    = toks[5];
+  azS    = toks[6];
+  gxS    = toks[7];
+  gyS    = toks[8];
+  gzS    = toks[9];
+  tCS    = toks[10];
+  tFS    = toks[11];
+
+  if (toks[12] != "MAG") return false;
+  if (toks[14] != "RW")  return false;
+
+  magS = (toks[13] == "1") ? "ON" : "OFF";
+  rwS  = (toks[15] == "1") ? "ENABLED" : "DISABLED";
+
+  return true;
+}
+
+String createHTML() {
+  unsigned long age = (lastRxMs == 0) ? 0 : (millis() - lastRxMs);
+
+  String str = "<!DOCTYPE html><html><head>";
+  str += "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">";
+  str += "<meta http-equiv=\"refresh\" content=\"2\">";
+  str += "<title>Telemetry Dashboard</title>";
+  str += "<style>";
+  str += "body{font-family:Arial;color:#f0f0f0;background:#0b1020;text-align:center;}";
+  str += ".card{background:#151a2c;padding:20px;margin:18px auto;max-width:900px;border-radius:12px;}";
+  str += ".grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}";
+  str += ".box{padding:10px;border-radius:10px;background:#0f1324;text-align:left;}";
+  str += ".mono{font-family:monospace;}";
+  str += "button{padding:10px;margin:6px;border-radius:10px;}";
+  str += "</style></head><body>";
+
+  str += "<h1>Telemetry Dashboard</h1>";
+
+  str += "<div class='card'><h2>Controls</h2>";
+  str += "<a href='/cmd?mag=1'><button>MAG ON</button></a>";
+  str += "<a href='/cmd?mag=0'><button>MAG OFF</button></a><br>";
+  str += "<a href='/cmd?rw=1'><button>RW ENABLE</button></a>";
+  str += "<a href='/cmd?rw=0'><button>RW DISABLE</button></a>";
+  str += "</div>";
+
+  str += "<div class='card'><h2>Telemetry</h2><div class='grid'>";
+  str += "<div class='box'>CTR<br><span class='mono'>" + ctrS + "</span></div>";
+  str += "<div class='box'>Pitch<br><span class='mono'>" + pitchS + "</span></div>";
+  str += "<div class='box'>Roll<br><span class='mono'>" + rollS + "</span></div>";
+  str += "<div class='box'>MAG<br><span class='mono'>" + magS + "</span></div>";
+  str += "<div class='box'>RW<br><span class='mono'>" + rwS + "</span></div>";
+  str += "<div class='box'>RSSI<br><span class='mono'>" + String(lastRxRSSI) + "</span></div>";
+  str += "</div>";
+  str += "<p>RX count: " + String(rxCount) +
+         " | Last age: " + String(age) + " ms</p>";
+  str += "<p class='mono'>" + lastRxRaw + "</p>";
+  str += "</div>";
+
+  str += "</body></html>";
+  return str;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", createHTML());
+}
+
 void setup() {
   Serial.begin(115200);
-  delay(300);
+  delay(1000);
 
-  pinMode(MAG_PIN, OUTPUT);
-  pinMode(RW_PIN, OUTPUT);
-
-  // ESC PWM setup (ESP32 core 3.x)
-  analogWriteFrequency(RW_PIN, ESC_FREQ_HZ);
-  analogWriteResolution(RW_PIN, ESC_PWM_BITS);
-
-  // Arm ESC
-  setESCmicroseconds(ESC_US_IDLE);
-  delay(3000);   // match MicroPython arming delay
-
-  Wire.begin(I2C_SDA, I2C_SCL);
-  Wire.beginTransmission(MPU);
-  Wire.write(0x6B);
-  Wire.write(0);
-  Wire.endTransmission(true);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
 
   SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_SS);
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
 
-  LoRa.begin(LORA_FREQ);
+  if (!LoRa.begin(LORA_FREQ)) {
+    while (true);
+  }
+
   LoRa.setSpreadingFactor(7);
   LoRa.setSignalBandwidth(125E3);
   LoRa.setCodingRate4(5);
   LoRa.setSyncWord(0x12);
   LoRa.enableCrc();
   LoRa.setPreambleLength(8);
-  LoRa.setTxPower(17);
-  LoRa.receive();
+  LoRa.receive();     // <<< START IN RX MODE
 
-  lastTx = millis();
-  Serial.println("Sender ready: ESC PWM on GPIO32, MAG on GPIO14");
+  server.on("/", handleRoot);
+  server.on("/cmd", handleCmd);
+  server.begin();
+
+  Serial.println("Groundstation ready.");
 }
 
-// =====================
-// LOOP
-// =====================
 void loop() {
-  handleLoRaCommands();
+  server.handleClient();
 
-  if (millis() - lastTx >= 1000) {
-    lastTx += 1000;
-    sampleIMU();
-    sendTelemetry();
-    counter++;
-  }
+  int packetSize = LoRa.parsePacket();
+  if (!packetSize) return;
+
+  String rx;
+  while (LoRa.available()) rx += (char)LoRa.read();
+
+  lastRxRSSI = LoRa.packetRssi();
+  lastRxMs = millis();
+  rxCount++;
+
+  lastRxRaw = sanitizeRx(rx);
+  bool ok = parseIMUTelemetry(lastRxRaw);
+
+  addToRxLog((ok ? "" : "UNPARSED: ") + lastRxRaw +
+             " (RSSI " + String(lastRxRSSI) + ")");
+
+  Serial.println("RX: " + lastRxRaw);
 }
